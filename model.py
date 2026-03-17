@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoConfig
 
-MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
 
 print(f"Loading model: {MODEL_NAME}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
