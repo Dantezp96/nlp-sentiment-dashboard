@@ -1,6 +1,9 @@
 """NLP Sentiment Analysis Dashboard - Gradio Application."""
 
 import os
+import time
+import collections
+import threading
 import gradio as gr
 import pandas as pd
 from model import predict_single, predict_batch, get_top_sentiment, LABELS
@@ -15,23 +18,72 @@ from dashboard import (
 from utils import preprocess_text, parse_csv, load_sample_dataset, get_available_datasets
 
 
+# ── Rate Limiter ─────────────────────────────────────────────────────
+
+RATE_LIMITS = {
+    "single":    {"calls": 15, "window": 60},   # 15 análisis/min por IP
+    "batch":     {"calls": 5,  "window": 60},   # 5 lotes/min por IP
+    "dashboard": {"calls": 3,  "window": 60},   # 3 dashboards/min por IP
+}
+
+_rate_data: dict[str, dict[str, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
+_rate_lock = threading.Lock()
+
+
+def check_rate_limit(ip: str, action: str) -> tuple[bool, str]:
+    """Returns (allowed, error_message). Thread-safe sliding window."""
+    limit = RATE_LIMITS[action]
+    max_calls = limit["calls"]
+    window = limit["window"]
+    now = time.time()
+
+    with _rate_lock:
+        timestamps = _rate_data[ip][action]
+        # Purge expired entries
+        _rate_data[ip][action] = [t for t in timestamps if now - t < window]
+        if len(_rate_data[ip][action]) >= max_calls:
+            oldest = _rate_data[ip][action][0]
+            wait = int(window - (now - oldest)) + 1
+            return False, f"⚠️ Límite alcanzado. Intenta de nuevo en {wait}s."
+        _rate_data[ip][action].append(now)
+        return True, ""
+
+
+def get_ip(request: gr.Request) -> str:
+    """Extract client IP, respecting X-Forwarded-For from proxies."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 # ── Tab 1: Analyze Text ─────────────────────────────────────────────
 
-def analyze_single(text: str):
-    """Analyze a single text input."""
+def analyze_single(text: str, request: gr.Request):
+    """Analiza un solo texto."""
+    ip = get_ip(request)
+    allowed, err = check_rate_limit(ip, "single")
+    if not allowed:
+        return {}, err
+
     if not text or not text.strip():
-        return {}, "Enter some text to analyze"
+        return {}, "Ingresa algún texto para analizar."
     text = preprocess_text(text)
     scores = predict_single(text)
     top_label, top_conf = get_top_sentiment(scores)
-    summary = f"**{top_label.capitalize()}** ({top_conf:.1%} confidence)"
+    label_map = {"positive": "Positivo", "neutral": "Neutral", "negative": "Negativo"}
+    summary = f"**{label_map.get(top_label, top_label.capitalize())}** ({top_conf:.1%} de confianza)"
     return scores, summary
 
 
-def analyze_batch(text_input: str, file_input):
-    """Analyze multiple texts from textarea or CSV file."""
-    texts = []
+def analyze_batch(text_input: str, file_input, request: gr.Request):
+    """Analiza múltiples textos desde textarea o archivo CSV."""
+    ip = get_ip(request)
+    allowed, err = check_rate_limit(ip, "batch")
+    if not allowed:
+        return None, None, None
 
+    texts = []
     if file_input is not None:
         df = parse_csv(file_input)
         texts = df["text"].dropna().astype(str).tolist()
@@ -44,17 +96,17 @@ def analyze_batch(text_input: str, file_input):
     texts = [preprocess_text(t) for t in texts]
     results = predict_batch(texts)
 
-    # Build results dataframe
     rows = []
+    label_map = {"positive": "Positivo", "neutral": "Neutral", "negative": "Negativo"}
     for text, scores in zip(texts, results):
         top_label, top_conf = get_top_sentiment(scores)
         rows.append({
-            "Text": text[:100] + ("..." if len(text) > 100 else ""),
-            "Sentiment": top_label.capitalize(),
-            "Confidence": f"{top_conf:.1%}",
-            "Positive": f"{scores.get('positive', 0):.3f}",
+            "Texto": text[:100] + ("..." if len(text) > 100 else ""),
+            "Sentimiento": label_map.get(top_label, top_label.capitalize()),
+            "Confianza": f"{top_conf:.1%}",
+            "Positivo": f"{scores.get('positive', 0):.3f}",
             "Neutral": f"{scores.get('neutral', 0):.3f}",
-            "Negative": f"{scores.get('negative', 0):.3f}",
+            "Negativo": f"{scores.get('negative', 0):.3f}",
         })
 
     result_df = pd.DataFrame(rows)
@@ -67,8 +119,13 @@ def analyze_batch(text_input: str, file_input):
 
 # ── Tab 2: Dashboard ────────────────────────────────────────────────
 
-def run_dashboard(dataset_name: str, sample_size: int):
-    """Run full dashboard analysis on a sample dataset."""
+def run_dashboard(dataset_name: str, sample_size: int, request: gr.Request):
+    """Genera dashboard completo sobre un dataset de muestra."""
+    ip = get_ip(request)
+    allowed, err = check_rate_limit(ip, "dashboard")
+    if not allowed:
+        return (err,) + (None,) * 11
+
     df = load_sample_dataset(dataset_name)
     df = df.sample(n=min(sample_size, len(df)), random_state=42).reset_index(drop=True)
 
@@ -86,13 +143,13 @@ def run_dashboard(dataset_name: str, sample_size: int):
     temporal_fig = create_temporal_trends(results, timestamps) if timestamps else None
 
     sample_df = pd.DataFrame({
-        "Text": [t[:80] + "..." if len(t) > 80 else t for t in texts[:20]],
-        "Sentiment": [s.capitalize() for s in sentiments[:20]],
-        "Confidence": [f"{max(r.values()):.1%}" for r in results[:20]],
+        "Texto": [t[:80] + "..." if len(t) > 80 else t for t in texts[:20]],
+        "Sentimiento": [s.capitalize() for s in sentiments[:20]],
+        "Confianza": [f"{max(r.values()):.1%}" for r in results[:20]],
     })
 
     return (
-        f"### {stats['total']} texts analyzed",
+        f"### {stats['total']} textos analizados",
         f"### {stats['positive_pct']}%",
         f"### {stats['negative_pct']}%",
         f"### {stats['neutral_pct']}%",
@@ -117,7 +174,7 @@ custom_css = """
 # ── Build UI ─────────────────────────────────────────────────────────
 
 with gr.Blocks(
-    title="NLP Sentiment Dashboard",
+    title="Dashboard de Análisis de Sentimientos NLP",
     theme=gr.themes.Soft(
         primary_hue="violet",
         secondary_hue="emerald",
@@ -127,46 +184,47 @@ with gr.Blocks(
 ) as demo:
 
     gr.Markdown(
-        "# 🔍 NLP Sentiment Analysis Dashboard\n"
-        "Real-time sentiment analysis powered by **RoBERTa** (cardiffnlp/twitter-roberta-base-sentiment-latest)"
+        "# 🔍 Dashboard de Análisis de Sentimientos NLP\n"
+        "Análisis de sentimientos en tiempo real impulsado por **RoBERTa** "
+        "(cardiffnlp/twitter-roberta-base-sentiment-latest)"
     )
 
-    # ── Tab 1: Analyze ──
-    with gr.Tab("Analyze Text"):
-        gr.Markdown("### Single Text Analysis")
+    # ── Tab 1: Analizar ──
+    with gr.Tab("Analizar Texto"):
+        gr.Markdown("### Análisis de Texto Individual")
         with gr.Row():
             with gr.Column(scale=3):
                 text_input = gr.Textbox(
-                    label="Enter text",
-                    placeholder="Type a sentence to analyze its sentiment...",
+                    label="Ingresa un texto",
+                    placeholder="Escribe una oración para analizar su sentimiento...",
                     lines=3,
                 )
             with gr.Column(scale=1):
-                analyze_btn = gr.Button("Analyze", variant="primary", size="lg")
+                analyze_btn = gr.Button("Analizar", variant="primary", size="lg")
 
         with gr.Row():
-            label_output = gr.Label(label="Sentiment Scores", num_top_classes=3)
+            label_output = gr.Label(label="Puntuaciones de Sentimiento", num_top_classes=3)
             summary_output = gr.Markdown()
 
         analyze_btn.click(analyze_single, inputs=text_input, outputs=[label_output, summary_output])
         text_input.submit(analyze_single, inputs=text_input, outputs=[label_output, summary_output])
 
-        gr.Markdown("---\n### Batch Analysis")
-        gr.Markdown("Paste multiple lines or upload a CSV file with a `text` column.")
+        gr.Markdown("---\n### Análisis por Lotes")
+        gr.Markdown("Pega múltiples líneas o sube un archivo CSV con columna `text`.")
 
         with gr.Row():
             batch_text = gr.Textbox(
-                label="Paste texts (one per line)",
+                label="Pega textos (uno por línea)",
                 lines=5,
-                placeholder="First text to analyze\nSecond text\nThird text...",
+                placeholder="Primer texto a analizar\nSegundo texto\nTercer texto...",
             )
-            batch_file = gr.File(label="Or upload CSV", file_types=[".csv", ".txt"])
+            batch_file = gr.File(label="O sube un CSV", file_types=[".csv", ".txt"])
 
-        batch_btn = gr.Button("Analyze Batch", variant="primary")
+        batch_btn = gr.Button("Analizar Lote", variant="primary")
 
-        batch_df = gr.Dataframe(label="Results", interactive=False)
-        batch_chart = gr.Plot(label="Distribution")
-        batch_csv = gr.File(label="Download Results")
+        batch_df = gr.Dataframe(label="Resultados", interactive=False)
+        batch_chart = gr.Plot(label="Distribución")
+        batch_csv = gr.File(label="Descargar Resultados")
 
         batch_btn.click(
             analyze_batch,
@@ -180,14 +238,16 @@ with gr.Blocks(
                 ["The service was okay, nothing special but not terrible either."],
                 ["Terrible experience. The item arrived broken and customer support was unhelpful."],
                 ["Just finished watching the new movie. The cinematography was stunning but the plot was predictable."],
+                ["¡Me encantó la atención al cliente, super rápidos y amables!"],
+                ["El producto llegó en mal estado y el soporte no respondió nunca."],
             ],
             inputs=text_input,
         )
 
     # ── Tab 2: Dashboard ──
     with gr.Tab("Dashboard"):
-        gr.Markdown("### Pre-loaded Dataset Analysis")
-        gr.Markdown("Select a dataset and sample size to generate a full sentiment analysis dashboard.")
+        gr.Markdown("### Análisis de Dataset Precargado")
+        gr.Markdown("Selecciona un dataset y tamaño de muestra para generar un dashboard completo.")
 
         with gr.Row():
             dataset_dd = gr.Dropdown(
@@ -197,11 +257,10 @@ with gr.Blocks(
             )
             sample_slider = gr.Slider(
                 minimum=50, maximum=2000, value=500, step=50,
-                label="Sample Size",
+                label="Tamaño de Muestra",
             )
-            dash_btn = gr.Button("Generate Dashboard", variant="primary")
+            dash_btn = gr.Button("Generar Dashboard", variant="primary")
 
-        # Stats row
         with gr.Row():
             stat_total = gr.Markdown("### -", elem_classes=["stat-card"])
             stat_pos = gr.Markdown("### -", elem_classes=["stat-card"])
@@ -210,23 +269,23 @@ with gr.Blocks(
             stat_conf = gr.Markdown("### -", elem_classes=["stat-card"])
 
         with gr.Row():
-            gr.Markdown("**Total Texts**", elem_classes=["stat-card"])
-            gr.Markdown("**Positive %**", elem_classes=["stat-card"])
-            gr.Markdown("**Negative %**", elem_classes=["stat-card"])
-            gr.Markdown("**Neutral %**", elem_classes=["stat-card"])
-            gr.Markdown("**Avg Confidence**", elem_classes=["stat-card"])
+            gr.Markdown("**Total de Textos**", elem_classes=["stat-card"])
+            gr.Markdown("**% Positivos**", elem_classes=["stat-card"])
+            gr.Markdown("**% Negativos**", elem_classes=["stat-card"])
+            gr.Markdown("**% Neutrales**", elem_classes=["stat-card"])
+            gr.Markdown("**Confianza Promedio**", elem_classes=["stat-card"])
 
         with gr.Row():
-            dash_dist = gr.Plot(label="Sentiment Distribution")
-            dash_conf = gr.Plot(label="Confidence Scores")
+            dash_dist = gr.Plot(label="Distribución de Sentimientos")
+            dash_conf = gr.Plot(label="Puntuaciones de Confianza")
 
         with gr.Row():
-            dash_wc_pos = gr.Image(label="Positive Word Cloud", type="pil")
-            dash_wc_neg = gr.Image(label="Negative Word Cloud", type="pil")
+            dash_wc_pos = gr.Image(label="Nube de Palabras Positivas", type="pil")
+            dash_wc_neg = gr.Image(label="Nube de Palabras Negativas", type="pil")
 
-        dash_top_words = gr.Plot(label="Top Words by Sentiment")
-        dash_temporal = gr.Plot(label="Sentiment Trends Over Time")
-        dash_sample = gr.Dataframe(label="Sample Predictions", interactive=False)
+        dash_top_words = gr.Plot(label="Palabras Más Frecuentes por Sentimiento")
+        dash_temporal = gr.Plot(label="Tendencias de Sentimiento en el Tiempo")
+        dash_sample = gr.Dataframe(label="Predicciones de Muestra", interactive=False)
 
         dash_btn.click(
             run_dashboard,
@@ -238,40 +297,47 @@ with gr.Blocks(
             ],
         )
 
-    # ── Tab 3: About ──
-    with gr.Tab("About"):
+    # ── Tab 3: Acerca de ──
+    with gr.Tab("Acerca de"):
         gr.Markdown("""
-## About This Project
+## Acerca de Este Proyecto
 
-This **NLP Sentiment Analysis Dashboard** is a real-time sentiment classification tool built
-by **Omar Daniel Zorro** as part of his Data Science & ML portfolio.
+Este **Dashboard de Análisis de Sentimientos NLP** es una herramienta de clasificación de sentimientos
+en tiempo real, construida por **Omar Daniel Zorro** como parte de su portafolio de Data Science & ML.
 
-### Model
-- **Architecture**: RoBERTa-base fine-tuned on ~124M tweets
-- **Model ID**: `cardiffnlp/twitter-roberta-base-sentiment-latest`
-- **Classes**: Negative, Neutral, Positive
-- **Inference**: ~100ms per text on CPU
+### Modelo
+- **Arquitectura**: RoBERTa-base ajustado con ~124M tweets
+- **ID del Modelo**: `cardiffnlp/twitter-roberta-base-sentiment-latest`
+- **Clases**: Negativo, Neutral, Positivo
+- **Inferencia**: ~100ms por texto en CPU
 
-### Tech Stack
-| Component | Technology |
+### Stack Tecnológico
+| Componente | Tecnología |
 |-----------|-----------|
-| UI Framework | Gradio |
-| ML Model | HuggingFace Transformers |
+| Framework UI | Gradio |
+| Modelo ML | HuggingFace Transformers |
 | Deep Learning | PyTorch (CPU) |
-| Visualization | Matplotlib, WordCloud |
-| Data Processing | Pandas, NumPy |
-| Deployment | Railway (Docker) |
+| Visualización | Matplotlib, WordCloud |
+| Procesamiento | Pandas, NumPy |
+| Despliegue | Railway (Docker) |
+
+### Límites de uso (por IP)
+| Acción | Límite |
+|--------|--------|
+| Análisis individual | 15 por minuto |
+| Análisis por lotes | 5 por minuto |
+| Generación de dashboard | 3 por minuto |
 
 ### Datasets
-- **Tweets**: TweetEval Sentiment dataset (Barbieri et al., 2020) — 2,000 sample tweets
-- **Reviews**: Amazon Polarity dataset — 1,000 sample product reviews
+- **Tweets**: TweetEval Sentiment dataset (Barbieri et al., 2020) — 2,000 tweets de muestra
+- **Reseñas**: Amazon Polarity dataset — 1,000 reseñas de productos
 
-### Links
-- [Portfolio](https://frontend-mauve-seven-17.vercel.app)
-- [GitHub Repository](https://github.com/Dantezp96/nlp-sentiment-dashboard)
+### Enlaces
+- [Portafolio](https://frontend-mauve-seven-17.vercel.app)
+- [Repositorio GitHub](https://github.com/Dantezp96/nlp-sentiment-dashboard)
 
 ---
-*Built with HuggingFace Transformers and Gradio*
+*Construido con HuggingFace Transformers y Gradio*
         """)
 
 
